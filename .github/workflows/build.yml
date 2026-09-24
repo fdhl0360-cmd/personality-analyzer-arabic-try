@@ -19,6 +19,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Install tools
+        run: |
+          set -e
+          sudo apt-get update
+          sudo apt-get install -y unzip libxml2-utils
+
       - name: Extract project
         shell: bash
         run: |
@@ -32,13 +38,22 @@ jobs:
           fi
 
           rm -rf extracted
-          mkdir extracted
+          mkdir -p extracted
+
           unzip -q "$ZIP_FILE" -d extracted
 
-          # Pick the shallowest pubspec.yaml (ignore __MACOSX and hidden folders)
-          PUBSPEC=$(find extracted -type f -name "pubspec.yaml" \
-            -not -path "*/__MACOSX/*" -not -path "*/.*/*" \
-            | awk '{ print gsub("/","/"), $0 }' | sort -n | head -1 | cut -d' ' -f2-)
+          PUBSPEC=""
+
+          while IFS= read -r FILE; do
+            PUBSPEC="$FILE"
+            break
+          done < <(
+            find extracted \
+              -type f \
+              -name "pubspec.yaml" \
+              -not -path "*/__MACOSX/*" \
+              -not -path "*/.*/*"
+          )
 
           if [ -z "$PUBSPEC" ]; then
             echo "ERROR: pubspec.yaml not found"
@@ -46,8 +61,11 @@ jobs:
           fi
 
           PROJECT_DIR=$(dirname "$PUBSPEC")
+
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-          echo "Project: $PROJECT_DIR"
+
+          echo "Project directory:"
+          echo "$PROJECT_DIR"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -69,101 +87,211 @@ jobs:
           set -euo pipefail
 
           if grep -qE '^[[:space:]]+google_mobile_ads:' pubspec.yaml; then
-            # Only rewrites single-line entries (google_mobile_ads: ^x.y.z)
-            sed -i -E 's/^([[:space:]]+google_mobile_ads:)[[:space:]]*[^[:space:]#].*$/\1 ^7.0.0/' pubspec.yaml
+            sed -i -E \
+              's/^([[:space:]]+google_mobile_ads:)[[:space:]]*.*/\1 ^7.0.0/' \
+              pubspec.yaml
           else
-            echo "WARNING: google_mobile_ads not found in pubspec.yaml"
+            echo "WARNING: google_mobile_ads not found"
           fi
 
+          echo "Current AdMob dependency:"
           grep "google_mobile_ads:" pubspec.yaml || true
 
-      - name: Migrate Android project (v1 -> v2 embedding)
+      - name: Migrate Android project
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euo pipefail
 
-          ADMOB_ID=""
           MANIFEST="android/app/src/main/AndroidManifest.xml"
-
-          # Flutter 3.35 needs the new Gradle plugin format + v2 embedding.
-          # Old (v1) projects are regenerated instead of patched with sed.
           NEEDS_REGEN=false
-          if [ ! -d android ]; then
+
+          echo "Checking Android project..."
+
+          if [ ! -d "android" ]; then
             NEEDS_REGEN=true
-          elif ! grep -qs 'dev.flutter.flutter-plugin-loader' android/settings.gradle android/settings.gradle.kts; then
+          elif [ ! -f "android/settings.gradle" ] && [ ! -f "android/settings.gradle.kts" ]; then
             NEEDS_REGEN=true
+          elif [ -f "android/settings.gradle" ]; then
+            if ! grep -q "dev.flutter.flutter-plugin-loader" android/settings.gradle; then
+              NEEDS_REGEN=true
+            fi
+          elif [ -f "android/settings.gradle.kts" ]; then
+            if ! grep -q "dev.flutter.flutter-plugin-loader" android/settings.gradle.kts; then
+              NEEDS_REGEN=true
+            fi
           fi
 
-          if [ "$NEEDS_REGEN" = true ]; then
-            echo "Old Android project detected - regenerating..."
+          ADMOB_ID=""
+          APP_ID=""
+          LABEL=""
 
-            OLD_MANIFEST="android_old/app/src/main/AndroidManifest.xml"
-            if [ -d android ]; then
+          if [ "$NEEDS_REGEN" = true ]; then
+            echo "Old Android project detected."
+            echo "Regenerating Android project with Flutter 3.35..."
+
+            if [ -d "android" ]; then
+              rm -rf android_old
               mv android android_old
             fi
 
-            PROJECT_NAME=$(sed -nE 's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' pubspec.yaml | head -1)
-            APP_ID=""
-            LABEL=""
+            OLD_MANIFEST="android_old/app/src/main/AndroidManifest.xml"
 
-            if [ -d android_old ]; then
-              APP_ID=$(cat android_old/app/build.gradle* 2>/dev/null \
-                | sed -nE "s/.*applicationId[[:space:]=]+[\"']([^\"']+)[\"'].*/\1/p" | head -1 || true)
+            PROJECT_NAME=$(sed -nE \
+              's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' \
+              pubspec.yaml | head -1)
+
+            if [ -z "$PROJECT_NAME" ]; then
+              echo "ERROR: Could not determine Flutter project name"
+              exit 1
             fi
-            if [ -f "$OLD_MANIFEST" ]; then
-              ADMOB_ID=$(grep -hoE 'ca-app-pub-[0-9]+~[0-9]+' "$OLD_MANIFEST" | head -1 || true)
-              LABEL=$(sed -nE 's/.*android:label="([^"]+)".*/\1/p' "$OLD_MANIFEST" | head -1 || true)
+
+            echo "Project name: $PROJECT_NAME"
+
+            if [ -d "android_old" ]; then
+
+              if [ -f "android_old/app/build.gradle" ]; then
+                APP_ID=$(sed -nE \
+                  's/.*applicationId[[:space:]]+"([^"]+)".*/\1/p' \
+                  android_old/app/build.gradle | head -1 || true)
+              fi
+
+              if [ -z "$APP_ID" ] && [ -f "android_old/app/build.gradle.kts" ]; then
+                APP_ID=$(sed -nE \
+                  's/.*applicationId[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' \
+                  android_old/app/build.gradle.kts | head -1 || true)
+              fi
+
+              if [ -f "$OLD_MANIFEST" ]; then
+                ADMOB_ID=$(grep -hoE \
+                  'ca-app-pub-[0-9]+~[0-9]+' \
+                  "$OLD_MANIFEST" | head -1 || true)
+
+                LABEL=$(sed -nE \
+                  's/.*android:label="([^"]+)".*/\1/p' \
+                  "$OLD_MANIFEST" | head -1 || true)
+              fi
             fi
 
             ORG="com.example"
-            if [ -n "$APP_ID" ] && [[ "$APP_ID" == *".$PROJECT_NAME" ]]; then
-              ORG="${APP_ID%.$PROJECT_NAME}"
-            fi
 
-            flutter create --platforms=android --org "$ORG" --project-name "$PROJECT_NAME" .
-
-            # Keep the original applicationId
             if [ -n "$APP_ID" ]; then
-              sed -i -E "s/(applicationId[[:space:]]*=?[[:space:]]*)\"[^\"]+\"/\1\"$APP_ID\"/" android/app/build.gradle*
+              if [[ "$APP_ID" == *".$PROJECT_NAME" ]]; then
+                ORG="${APP_ID%.$PROJECT_NAME}"
+              fi
             fi
 
-            # Keep the original app name (skip @string references)
+            echo "Application ID: ${APP_ID:-not found}"
+            echo "Organization: $ORG"
+            echo "AdMob ID: ${ADMOB_ID:-not found}"
+
+            flutter create \
+              --platforms=android \
+              --org "$ORG" \
+              --project-name "$PROJECT_NAME" \
+              .
+
+            if [ -n "$APP_ID" ]; then
+
+              if [ -f "android/app/build.gradle" ]; then
+                sed -i -E \
+                  "s/applicationId[[:space:]]+\"[^\"]+\"/applicationId \"$APP_ID\"/" \
+                  android/app/build.gradle
+              fi
+
+              if [ -f "android/app/build.gradle.kts" ]; then
+                sed -i -E \
+                  "s/applicationId[[:space:]]*=[[:space:]]*\"[^\"]+\"/applicationId = \"$APP_ID\"/" \
+                  android/app/build.gradle.kts
+              fi
+
+            fi
+
             if [ -n "$LABEL" ] && [[ "$LABEL" != @* ]]; then
-              LABEL_ESC=$(printf '%s' "$LABEL" | sed 's/[&#\\]/\\&/g')
-              sed -i "0,/android:label=\"[^\"]*\"/s#android:label=\"[^\"]*\"#android:label=\"$LABEL_ESC\"#" "$MANIFEST"
+              sed -i -E \
+                "s/android:label=\"[^\"]*\"/android:label=\"$LABEL\"/" \
+                "$MANIFEST"
             fi
 
-            # Keep the original launcher icons
-            if [ -d android_old ]; then
-              for d in android_old/app/src/main/res/mipmap-*; do
-                if [ -d "$d" ]; then cp -r "$d" android/app/src/main/res/; fi
-              done
+            if [ -d "android_old/app/src/main/res" ]; then
+              cp -r \
+                android_old/app/src/main/res/. \
+                android/app/src/main/res/ \
+                2>/dev/null || true
             fi
+
+          else
+            echo "Android project already uses modern Flutter embedding."
           fi
 
-          : "${ADMOB_ID:=ca-app-pub-3940256099942544~3347511713}"
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
 
-          # AdMob requires the APPLICATION_ID meta-data, otherwise the app crashes on launch
-          if ! grep -q 'com.google.android.gms.ads.APPLICATION_ID' "$MANIFEST"; then
-            sed -i "s#</application>#    <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"${ADMOB_ID}\"/>\n    </application>#" "$MANIFEST"
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: AndroidManifest.xml not found"
+            exit 1
           fi
 
-          # Ads need internet access in release builds
-          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
-            sed -i '0,/<application/s#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$MANIFEST"
+          echo "Configuring AndroidManifest.xml..."
+
+          # Replace old Flutter v1 Activity reference if present.
+          sed -i \
+            's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
+            "$MANIFEST"
+
+          # Add INTERNET permission if missing.
+          if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
+            sed -i \
+              '0,/<application/s#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' \
+              "$MANIFEST"
           fi
+
+          # Add Flutter embedding metadata if missing.
+          if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
+            sed -i \
+              's#</application>#        <meta-data android:name="flutterEmbedding" android:value="2" />\n    </application>#' \
+              "$MANIFEST"
+          fi
+
+          # Use the real AdMob App ID if found.
+          if [ -z "$ADMOB_ID" ]; then
+            ADMOB_ID="ca-app-pub-3940256099942544~3347511713"
+            echo "Using Google test AdMob App ID."
+          else
+            echo "Using project AdMob App ID."
+          fi
+
+          # Add AdMob App ID if missing.
+          if ! grep -q "com.google.android.gms.ads.APPLICATION_ID" "$MANIFEST"; then
+            sed -i \
+              "s#</application>#        <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"$ADMOB_ID\" />\n    </application>#" \
+              "$MANIFEST"
+          fi
+
+          echo "Validating AndroidManifest.xml..."
 
           xmllint --noout "$MANIFEST"
-          echo "AndroidManifest.xml is valid."
+
+          echo "AndroidManifest.xml is VALID."
+
+          echo "---- AndroidManifest.xml ----"
+          cat "$MANIFEST"
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+        shell: bash
+        run: |
+          set -euo pipefail
+          flutter pub get
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          flutter clean
+          flutter pub get
+          flutter build apk --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
