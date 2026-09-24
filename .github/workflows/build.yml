@@ -18,12 +18,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install unzip
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y unzip
 
-      - name: Extract project ZIP
+      - name: Extract project
         shell: bash
         run: |
           set -e
@@ -31,36 +31,27 @@ jobs:
           ZIP_FILE="personality_analyzer_ui_admob_test.zip"
 
           if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: ZIP file not found: $ZIP_FILE"
+            echo "ERROR: ZIP file not found"
             exit 1
           fi
 
           rm -rf extracted
-          mkdir -p extracted
+          mkdir extracted
 
           unzip -q "$ZIP_FILE" -d extracted
-
-          echo "ZIP extracted successfully."
-
-      - name: Find Flutter project
-        shell: bash
-        run: |
-          set -e
 
           PUBSPEC=$(find extracted -type f -name "pubspec.yaml" -print -quit)
 
           if [ -z "$PUBSPEC" ]; then
-            echo "ERROR: pubspec.yaml not found."
-            find extracted -maxdepth 4 -type f | head -100
+            echo "ERROR: pubspec.yaml not found"
             exit 1
           fi
 
           PROJECT_DIR=$(dirname "$PUBSPEC")
 
-          echo "Flutter project found at:"
-          echo "$PROJECT_DIR"
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+          echo "Project: $PROJECT_DIR"
 
       - name: Setup Java
         uses: actions/setup-java@v4
@@ -75,8 +66,105 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Flutter version
-        run: flutter --version
+      - name: Migrate Android v1 to v2
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -e
+
+          echo "Checking Android project..."
+
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          if [ ! -f "$MANIFEST" ]; then
+            echo "ERROR: AndroidManifest.xml not found"
+            exit 1
+          fi
+
+          echo "Migrating MainActivity..."
+
+          find android/app/src/main -type f \( -name "MainActivity.java" -o -name "MainActivity.kt" \) -print
+
+          # Java MainActivity
+          while IFS= read -r FILE; do
+            echo "Fixing $FILE"
+
+            sed -i \
+              's/import io\.flutter\.app\.FlutterActivity;/import io.flutter.embedding.android.FlutterActivity;/' \
+              "$FILE"
+
+            sed -i \
+              '/import io\.flutter\.plugins\.GeneratedPluginRegistrant;/d' \
+              "$FILE"
+
+            sed -i \
+              '/GeneratedPluginRegistrant\.registerWith(this);/d' \
+              "$FILE"
+
+          done < <(find android/app/src/main -type f -name "MainActivity.java")
+
+          # Kotlin MainActivity
+          while IFS= read -r FILE; do
+            echo "Fixing $FILE"
+
+            sed -i \
+              's/import io\.flutter\.app\.FlutterActivity/import io.flutter.embedding.android.FlutterActivity/' \
+              "$FILE"
+
+            sed -i \
+              '/GeneratedPluginRegistrant/d' \
+              "$FILE"
+
+          done < <(find android/app/src/main -type f -name "MainActivity.kt")
+
+          # Fix old Flutter activity references in Manifest
+          sed -i \
+            's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
+            "$MANIFEST"
+
+          # Change embedding 1 -> 2 if it exists
+          sed -i \
+            's/android:name="flutterEmbedding"[[:space:]]*android:value="1"/android:name="flutterEmbedding" android:value="2"/g' \
+            "$MANIFEST"
+
+          # Add embedding=2 if it doesn't exist
+          if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
+            python3 - "$MANIFEST" <<'PY'
+import sys
+import re
+
+path = sys.argv[1]
+
+with open(path, "r", encoding="utf-8") as f:
+    text = f.read()
+
+meta = '''
+        <meta-data
+            android:name="flutterEmbedding"
+            android:value="2" />'''
+
+match = re.search(r'(<application\b[^>]*>)', text)
+
+if not match:
+    raise SystemExit("ERROR: <application> tag not found")
+
+pos = match.end()
+text = text[:pos] + meta + text[pos:]
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write(text)
+
+print("Added flutterEmbedding=2")
+PY
+          fi
+
+          echo "Android v1 migration completed."
+
+          echo "---- MainActivity files ----"
+          find android/app/src/main -type f \( -name "MainActivity.java" -o -name "MainActivity.kt" \) -exec sed -n '1,120p' {} \;
+
+          echo "---- AndroidManifest ----"
+          grep -n "flutterEmbedding\|FlutterActivity" "$MANIFEST" || true
 
       - name: Fix AdMob dependency
         working-directory: ${{ env.PROJECT_DIR }}
@@ -87,18 +175,17 @@ jobs:
           if grep -q "google_mobile_ads:" pubspec.yaml; then
             sed -i -E 's/^([[:space:]]*google_mobile_ads:).*/\1 ^7.0.0/' pubspec.yaml
           else
-            echo "ERROR: google_mobile_ads was not found in pubspec.yaml"
+            echo "ERROR: google_mobile_ads not found"
             exit 1
           fi
 
-          echo "AdMob dependency:"
           grep "google_mobile_ads:" pubspec.yaml
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter pub get
 
-      - name: Build release APK
+      - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
         run: flutter build apk --release
 
