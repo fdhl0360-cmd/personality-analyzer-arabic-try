@@ -233,26 +233,22 @@ jobs:
 
           echo "Configuring AndroidManifest.xml..."
 
-          # Replace old Flutter v1 Activity reference if present.
           sed -i \
             's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
             "$MANIFEST"
 
-          # Add INTERNET permission if missing.
           if ! grep -q "android.permission.INTERNET" "$MANIFEST"; then
             sed -i \
               '0,/<application/s#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' \
               "$MANIFEST"
           fi
 
-          # Add Flutter embedding metadata if missing.
           if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
             sed -i \
               's#</application>#        <meta-data android:name="flutterEmbedding" android:value="2" />\n    </application>#' \
               "$MANIFEST"
           fi
 
-          # Use the real AdMob App ID if found.
           if [ -z "$ADMOB_ID" ]; then
             ADMOB_ID="ca-app-pub-3940256099942544~3347511713"
             echo "Using Google test AdMob App ID."
@@ -260,21 +256,15 @@ jobs:
             echo "Using project AdMob App ID."
           fi
 
-          # Add AdMob App ID if missing.
           if ! grep -q "com.google.android.gms.ads.APPLICATION_ID" "$MANIFEST"; then
             sed -i \
               "s#</application>#        <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"$ADMOB_ID\" />\n    </application>#" \
               "$MANIFEST"
           fi
 
-          echo "Validating AndroidManifest.xml..."
-
           xmllint --noout "$MANIFEST"
 
           echo "AndroidManifest.xml is VALID."
-
-          echo "---- AndroidManifest.xml ----"
-          cat "$MANIFEST"
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
@@ -282,6 +272,29 @@ jobs:
         run: |
           set -euo pipefail
           flutter pub get
+
+      - name: Fix Flutter color constants
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Fixing unsupported Flutter color constants..."
+
+          find lib -type f -name "*.dart" -print0 | while IFS= read -r -d '' FILE; do
+            sed -i \
+              's/Colors\.white06/const Color(0x0FFFFFFF)/g' \
+              "$FILE"
+          done
+
+          echo "Checking remaining white06 references..."
+
+          if grep -R "Colors\.white06" lib --include="*.dart"; then
+            echo "ERROR: Colors.white06 still exists"
+            exit 1
+          fi
+
+          echo "Color constants fixed successfully."
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
