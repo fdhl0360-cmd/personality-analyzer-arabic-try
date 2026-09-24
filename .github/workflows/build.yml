@@ -13,34 +13,32 @@ jobs:
   build:
     name: Build APK
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y unzip libxml2-utils
-
       - name: Extract project
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           ZIP_FILE="personality_analyzer_ui_admob_test.zip"
 
           if [ ! -f "$ZIP_FILE" ]; then
-            echo "ERROR: ZIP file not found"
+            echo "ERROR: ZIP file not found: $ZIP_FILE"
             exit 1
           fi
 
           rm -rf extracted
           mkdir extracted
-
           unzip -q "$ZIP_FILE" -d extracted
 
-          PUBSPEC=$(find extracted -type f -name "pubspec.yaml" -print -quit)
+          # Pick the shallowest pubspec.yaml (ignore __MACOSX and hidden folders)
+          PUBSPEC=$(find extracted -type f -name "pubspec.yaml" \
+            -not -path "*/__MACOSX/*" -not -path "*/.*/*" \
+            | awk '{ print gsub("/","/"), $0 }' | sort -n | head -1 | cut -d' ' -f2-)
 
           if [ -z "$PUBSPEC" ]; then
             echo "ERROR: pubspec.yaml not found"
@@ -48,9 +46,7 @@ jobs:
           fi
 
           PROJECT_DIR=$(dirname "$PUBSPEC")
-
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
           echo "Project: $PROJECT_DIR"
 
       - name: Setup Java
@@ -66,82 +62,108 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Migrate Android v1 to v2
-        working-directory: ${{ env.PROJECT_DIR }}
-        shell: bash
-        run: |
-          set -e
-
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-
-          if [ ! -f "$MANIFEST" ]; then
-            echo "ERROR: AndroidManifest.xml not found"
-            exit 1
-          fi
-
-          echo "Fixing MainActivity..."
-
-          find android/app/src/main -type f \
-            \( -name "MainActivity.java" -o -name "MainActivity.kt" \) \
-            -print
-
-          while IFS= read -r FILE; do
-            sed -i \
-              's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
-              "$FILE"
-
-            sed -i \
-              '/GeneratedPluginRegistrant/d' \
-              "$FILE"
-
-          done < <(
-            find android/app/src/main -type f \
-              \( -name "MainActivity.java" -o -name "MainActivity.kt" \)
-          )
-
-          echo "Fixing AndroidManifest..."
-
-          sed -i \
-            's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
-            "$MANIFEST"
-
-          sed -i \
-            's/android:name="flutterEmbedding"[[:space:]]*android:value="1"/android:name="flutterEmbedding" android:value="2"/g' \
-            "$MANIFEST"
-
-          if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
-            sed -i '/<application /a\
-        <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST"
-          fi
-
-          echo "Checking AndroidManifest XML..."
-
-          xmllint --noout "$MANIFEST"
-
-          echo "AndroidManifest.xml is valid."
-
       - name: Fix AdMob dependency
         working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          sed -i -E \
-            's/^([[:space:]]*google_mobile_ads:).*/\1 ^7.0.0/' \
-            pubspec.yaml
+          if grep -qE '^[[:space:]]+google_mobile_ads:' pubspec.yaml; then
+            # Only rewrites single-line entries (google_mobile_ads: ^x.y.z)
+            sed -i -E 's/^([[:space:]]+google_mobile_ads:)[[:space:]]*[^[:space:]#].*$/\1 ^7.0.0/' pubspec.yaml
+          else
+            echo "WARNING: google_mobile_ads not found in pubspec.yaml"
+          fi
 
-          echo "AdMob dependency:"
-          grep "google_mobile_ads:" pubspec.yaml
+          grep "google_mobile_ads:" pubspec.yaml || true
+
+      - name: Migrate Android project (v1 -> v2 embedding)
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ADMOB_ID=""
+          MANIFEST="android/app/src/main/AndroidManifest.xml"
+
+          # Flutter 3.35 needs the new Gradle plugin format + v2 embedding.
+          # Old (v1) projects are regenerated instead of patched with sed.
+          NEEDS_REGEN=false
+          if [ ! -d android ]; then
+            NEEDS_REGEN=true
+          elif ! grep -qs 'dev.flutter.flutter-plugin-loader' android/settings.gradle android/settings.gradle.kts; then
+            NEEDS_REGEN=true
+          fi
+
+          if [ "$NEEDS_REGEN" = true ]; then
+            echo "Old Android project detected - regenerating..."
+
+            OLD_MANIFEST="android_old/app/src/main/AndroidManifest.xml"
+            if [ -d android ]; then
+              mv android android_old
+            fi
+
+            PROJECT_NAME=$(sed -nE 's/^name:[[:space:]]*([A-Za-z0-9_]+).*/\1/p' pubspec.yaml | head -1)
+            APP_ID=""
+            LABEL=""
+
+            if [ -d android_old ]; then
+              APP_ID=$(cat android_old/app/build.gradle* 2>/dev/null \
+                | sed -nE "s/.*applicationId[[:space:]=]+[\"']([^\"']+)[\"'].*/\1/p" | head -1 || true)
+            fi
+            if [ -f "$OLD_MANIFEST" ]; then
+              ADMOB_ID=$(grep -hoE 'ca-app-pub-[0-9]+~[0-9]+' "$OLD_MANIFEST" | head -1 || true)
+              LABEL=$(sed -nE 's/.*android:label="([^"]+)".*/\1/p' "$OLD_MANIFEST" | head -1 || true)
+            fi
+
+            ORG="com.example"
+            if [ -n "$APP_ID" ] && [[ "$APP_ID" == *".$PROJECT_NAME" ]]; then
+              ORG="${APP_ID%.$PROJECT_NAME}"
+            fi
+
+            flutter create --platforms=android --org "$ORG" --project-name "$PROJECT_NAME" .
+
+            # Keep the original applicationId
+            if [ -n "$APP_ID" ]; then
+              sed -i -E "s/(applicationId[[:space:]]*=?[[:space:]]*)\"[^\"]+\"/\1\"$APP_ID\"/" android/app/build.gradle*
+            fi
+
+            # Keep the original app name (skip @string references)
+            if [ -n "$LABEL" ] && [[ "$LABEL" != @* ]]; then
+              LABEL_ESC=$(printf '%s' "$LABEL" | sed 's/[&#\\]/\\&/g')
+              sed -i "0,/android:label=\"[^\"]*\"/s#android:label=\"[^\"]*\"#android:label=\"$LABEL_ESC\"#" "$MANIFEST"
+            fi
+
+            # Keep the original launcher icons
+            if [ -d android_old ]; then
+              for d in android_old/app/src/main/res/mipmap-*; do
+                if [ -d "$d" ]; then cp -r "$d" android/app/src/main/res/; fi
+              done
+            fi
+          fi
+
+          : "${ADMOB_ID:=ca-app-pub-3940256099942544~3347511713}"
+
+          # AdMob requires the APPLICATION_ID meta-data, otherwise the app crashes on launch
+          if ! grep -q 'com.google.android.gms.ads.APPLICATION_ID' "$MANIFEST"; then
+            sed -i "s#</application>#    <meta-data android:name=\"com.google.android.gms.ads.APPLICATION_ID\" android:value=\"${ADMOB_ID}\"/>\n    </application>#" "$MANIFEST"
+          fi
+
+          # Ads need internet access in release builds
+          if ! grep -q 'android.permission.INTERNET' "$MANIFEST"; then
+            sed -i '0,/<application/s#<application#<uses-permission android:name="android.permission.INTERNET"/>\n    <application#' "$MANIFEST"
+          fi
+
+          xmllint --noout "$MANIFEST"
+          echo "AndroidManifest.xml is valid."
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          flutter pub get
+        run: flutter pub get
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: |
-          flutter build apk --release
+        run: flutter build apk --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
