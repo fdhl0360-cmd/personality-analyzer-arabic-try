@@ -50,7 +50,6 @@ jobs:
           PROJECT_DIR=$(dirname "$PUBSPEC")
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
-
           echo "Project: $PROJECT_DIR"
 
       - name: Setup Java
@@ -72,8 +71,6 @@ jobs:
         run: |
           set -e
 
-          echo "Checking Android project..."
-
           MANIFEST="android/app/src/main/AndroidManifest.xml"
 
           if [ ! -f "$MANIFEST" ]; then
@@ -81,9 +78,7 @@ jobs:
             exit 1
           fi
 
-          echo "Migrating MainActivity..."
-
-          find android/app/src/main -type f \( -name "MainActivity.java" -o -name "MainActivity.kt" \) -print
+          echo "Migrating Android v1 to v2..."
 
           # Java MainActivity
           while IFS= read -r FILE; do
@@ -94,11 +89,7 @@ jobs:
               "$FILE"
 
             sed -i \
-              '/import io\.flutter\.plugins\.GeneratedPluginRegistrant;/d' \
-              "$FILE"
-
-            sed -i \
-              '/GeneratedPluginRegistrant\.registerWith(this);/d' \
+              '/GeneratedPluginRegistrant/d' \
               "$FILE"
 
           done < <(find android/app/src/main -type f -name "MainActivity.java")
@@ -117,53 +108,28 @@ jobs:
 
           done < <(find android/app/src/main -type f -name "MainActivity.kt")
 
-          # Fix old Flutter activity references in Manifest
+          # Fix old FlutterActivity in Manifest
           sed -i \
             's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
             "$MANIFEST"
 
-          # Change embedding 1 -> 2 if it exists
+          # Change embedding 1 to 2
           sed -i \
             's/android:name="flutterEmbedding"[[:space:]]*android:value="1"/android:name="flutterEmbedding" android:value="2"/g' \
             "$MANIFEST"
 
-          # Add embedding=2 if it doesn't exist
+          # Add embedding 2 if missing
           if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
-            python3 - "$MANIFEST" <<'PY'
-import sys
-import re
-
-path = sys.argv[1]
-
-with open(path, "r", encoding="utf-8") as f:
-    text = f.read()
-
-meta = '''
-        <meta-data
-            android:name="flutterEmbedding"
-            android:value="2" />'''
-
-match = re.search(r'(<application\b[^>]*>)', text)
-
-if not match:
-    raise SystemExit("ERROR: <application> tag not found")
-
-pos = match.end()
-text = text[:pos] + meta + text[pos:]
-
-with open(path, "w", encoding="utf-8") as f:
-    f.write(text)
-
-print("Added flutterEmbedding=2")
-PY
+            sed -i '/<application/a\
+                <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST"
           fi
 
-          echo "Android v1 migration completed."
+          echo "Android migration completed."
 
-          echo "---- MainActivity files ----"
+          echo "---- MainActivity ----"
           find android/app/src/main -type f \( -name "MainActivity.java" -o -name "MainActivity.kt" \) -exec sed -n '1,120p' {} \;
 
-          echo "---- AndroidManifest ----"
+          echo "---- Manifest ----"
           grep -n "flutterEmbedding\|FlutterActivity" "$MANIFEST" || true
 
       - name: Fix AdMob dependency
@@ -183,11 +149,13 @@ PY
 
       - name: Get dependencies
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter pub get
+        run: |
+          flutter pub get
 
       - name: Build APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: flutter build apk --release
+        run: |
+          flutter build apk --release
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
