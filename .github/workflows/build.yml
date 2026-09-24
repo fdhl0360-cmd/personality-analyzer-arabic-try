@@ -21,7 +21,7 @@ jobs:
       - name: Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y unzip
+          sudo apt-get install -y unzip libxml2-utils
 
       - name: Extract project
         shell: bash
@@ -50,6 +50,7 @@ jobs:
           PROJECT_DIR=$(dirname "$PUBSPEC")
 
           echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
           echo "Project: $PROJECT_DIR"
 
       - name: Setup Java
@@ -78,59 +79,46 @@ jobs:
             exit 1
           fi
 
-          echo "Migrating Android v1 to v2..."
+          echo "Fixing MainActivity..."
 
-          # Java MainActivity
+          find android/app/src/main -type f \
+            \( -name "MainActivity.java" -o -name "MainActivity.kt" \) \
+            -print
+
           while IFS= read -r FILE; do
-            echo "Fixing $FILE"
-
             sed -i \
-              's/import io\.flutter\.app\.FlutterActivity;/import io.flutter.embedding.android.FlutterActivity;/' \
+              's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
               "$FILE"
 
             sed -i \
               '/GeneratedPluginRegistrant/d' \
               "$FILE"
 
-          done < <(find android/app/src/main -type f -name "MainActivity.java")
+          done < <(
+            find android/app/src/main -type f \
+              \( -name "MainActivity.java" -o -name "MainActivity.kt" \)
+          )
 
-          # Kotlin MainActivity
-          while IFS= read -r FILE; do
-            echo "Fixing $FILE"
+          echo "Fixing AndroidManifest..."
 
-            sed -i \
-              's/import io\.flutter\.app\.FlutterActivity/import io.flutter.embedding.android.FlutterActivity/' \
-              "$FILE"
-
-            sed -i \
-              '/GeneratedPluginRegistrant/d' \
-              "$FILE"
-
-          done < <(find android/app/src/main -type f -name "MainActivity.kt")
-
-          # Fix old FlutterActivity in Manifest
           sed -i \
             's/io\.flutter\.app\.FlutterActivity/io.flutter.embedding.android.FlutterActivity/g' \
             "$MANIFEST"
 
-          # Change embedding 1 to 2
           sed -i \
             's/android:name="flutterEmbedding"[[:space:]]*android:value="1"/android:name="flutterEmbedding" android:value="2"/g' \
             "$MANIFEST"
 
-          # Add embedding 2 if missing
           if ! grep -q 'android:name="flutterEmbedding"' "$MANIFEST"; then
-            sed -i '/<application/a\
-                <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST"
+            sed -i '/<application /a\
+        <meta-data android:name="flutterEmbedding" android:value="2" />' "$MANIFEST"
           fi
 
-          echo "Android migration completed."
+          echo "Checking AndroidManifest XML..."
 
-          echo "---- MainActivity ----"
-          find android/app/src/main -type f \( -name "MainActivity.java" -o -name "MainActivity.kt" \) -exec sed -n '1,120p' {} \;
+          xmllint --noout "$MANIFEST"
 
-          echo "---- Manifest ----"
-          grep -n "flutterEmbedding\|FlutterActivity" "$MANIFEST" || true
+          echo "AndroidManifest.xml is valid."
 
       - name: Fix AdMob dependency
         working-directory: ${{ env.PROJECT_DIR }}
@@ -138,13 +126,11 @@ jobs:
         run: |
           set -e
 
-          if grep -q "google_mobile_ads:" pubspec.yaml; then
-            sed -i -E 's/^([[:space:]]*google_mobile_ads:).*/\1 ^7.0.0/' pubspec.yaml
-          else
-            echo "ERROR: google_mobile_ads not found"
-            exit 1
-          fi
+          sed -i -E \
+            's/^([[:space:]]*google_mobile_ads:).*/\1 ^7.0.0/' \
+            pubspec.yaml
 
+          echo "AdMob dependency:"
           grep "google_mobile_ads:" pubspec.yaml
 
       - name: Get dependencies
